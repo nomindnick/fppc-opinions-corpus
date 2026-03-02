@@ -60,6 +60,18 @@ HAIKU_OUTPUT_COST = 4.00
 REPORT_PATH = DATA_DIR / "qa_reports" / "haiku_reocr_report.json"
 SAMPLE_REPORT_PATH = DATA_DIR / "qa_reports" / "haiku_reocr_sample.json"
 
+# olmOCR docs with LLM chatbot artifacts (identified by hallucination audit)
+CONTAMINATED_IDS = [
+    342, 536, 1333, 1490, 4628, 4630, 4692, 4703, 4717, 4721, 4739, 4769,
+    4808, 4819, 4835, 4842, 4856, 4859, 4890, 4896, 4902, 4908, 4912, 4915,
+    4939, 4965, 5029, 5033, 5060, 8884, 8944, 8969, 9033, 9052, 9100, 9154,
+    9172, 9193, 9203, 9242, 9280, 9287, 9300, 9306, 9387, 9429, 9457, 9577,
+    9985, 10092, 10248, 10352, 10430, 10446, 10455, 10498, 10523, 10560,
+    10563, 10570, 10580, 10601, 10604, 10617, 10620, 10634, 10682, 11049,
+    11124, 11129, 11182, 11228, 11230, 11240, 11246, 11259, 11304, 11341,
+    11393, 11419, 11434, 11443, 11449, 11470, 11486,
+]
+
 # Transcription prompt — strict, no room for description-mode or paraphrasing
 TRANSCRIPTION_PROMPT = """Transcribe exactly what you see in this document image.
 Rules:
@@ -324,6 +336,64 @@ def get_flagged_docs(tier: str | None = None) -> list[dict]:
     return docs
 
 
+def get_contaminated_docs() -> list[dict]:
+    """Get olmOCR docs with LLM chatbot artifacts, excluding already re-extracted."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholders = ",".join("?" for _ in CONTAMINATED_IDS)
+    cursor.execute(f"""
+        SELECT id, letter_id, year_tag, extraction_method, extraction_quality,
+               fidelity_score, fidelity_risk, json_path, pdf_url, page_count
+        FROM documents
+        WHERE id IN ({placeholders})
+          AND extraction_method != 'haiku_vision'
+        ORDER BY year_tag
+    """, CONTAMINATED_IDS)
+    docs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    # Fill missing page_count from JSON
+    for d in docs:
+        if not d.get("page_count") and d.get("json_path"):
+            jp = os.path.join(str(DATA_DIR.parent), d["json_path"])
+            if os.path.exists(jp):
+                try:
+                    with open(jp) as f:
+                        data = json.load(f)
+                    d["page_count"] = data.get("extraction", {}).get("page_count")
+                except (json.JSONDecodeError, OSError):
+                    pass
+    return docs
+
+
+def get_tesseract_docs() -> list[dict]:
+    """Get all tesseract_fallback docs not yet re-extracted."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, letter_id, year_tag, extraction_method, extraction_quality,
+               fidelity_score, fidelity_risk, json_path, pdf_url, page_count
+        FROM documents
+        WHERE extraction_method = 'tesseract_fallback'
+        ORDER BY year_tag
+    """)
+    docs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    # Fill missing page_count from JSON
+    for d in docs:
+        if not d.get("page_count") and d.get("json_path"):
+            jp = os.path.join(str(DATA_DIR.parent), d["json_path"])
+            if os.path.exists(jp):
+                try:
+                    with open(jp) as f:
+                        data = json.load(f)
+                    d["page_count"] = data.get("extraction", {}).get("page_count")
+                except (json.JSONDecodeError, OSError):
+                    pass
+    return docs
+
+
 def select_sample(docs: list[dict], n: int) -> list[dict]:
     """
     Select a stratified sample across risk tiers and year decades.
@@ -512,6 +582,10 @@ def main():
                        help="Process all flagged documents")
     group.add_argument("--doc-id", type=int, metavar="ID",
                        help="Process a single document by DB id")
+    group.add_argument("--contaminated", action="store_true",
+                       help="Re-extract 85 olmOCR docs with LLM chatbot artifacts")
+    group.add_argument("--tesseract", action="store_true",
+                       help="Re-extract all tesseract_fallback docs")
 
     parser.add_argument("--tier", choices=["critical", "high", "medium"],
                         help="Filter to a specific risk tier")
@@ -531,6 +605,7 @@ def main():
     random.seed(args.seed)
 
     # --- Select documents ---
+    mode_label = "flagged"
     if args.doc_id:
         conn = get_connection()
         cursor = conn.cursor()
@@ -541,10 +616,17 @@ def main():
             print(f"Error: document {args.doc_id} not found")
             sys.exit(1)
         docs = [dict(row)]
+        mode_label = "single"
+    elif args.contaminated:
+        docs = get_contaminated_docs()
+        mode_label = "contaminated olmOCR"
+    elif args.tesseract:
+        docs = get_tesseract_docs()
+        mode_label = "tesseract_fallback"
     else:
         docs = get_flagged_docs(tier=args.tier)
 
-    print(f"Found {len(docs)} flagged documents", end="")
+    print(f"Found {len(docs)} {mode_label} documents", end="")
     if args.tier:
         print(f" (tier={args.tier})", end="")
     print()
